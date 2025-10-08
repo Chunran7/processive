@@ -49,6 +49,12 @@ class Runner(object):
         self.use_popart = self.all_args.use_popart
 
         self.safety_bound = self.all_args.safety_bound
+        
+        # Progressive training parameters
+        self.current_episode = 0
+        self.total_episodes = self.num_env_steps // self.episode_length // self.n_rollout_threads
+        self.initial_critical_ratio = 0.8  # 初始关键智能体比例（异步更新）
+        self.final_critical_ratio = 0.2    # 最终关键智能体比例（异步更新）
 
         # dir
         self.model_dir = self.all_args.model_dir
@@ -139,10 +145,12 @@ class Runner(object):
             self.buffer[agent_id].compute_cost_returns(next_costs, self.trainer[agent_id].value_normalizer)
 
     def train(self):
-        # have modified for SAD_PPO
+        # Progressive training with critical and regular agents
+        # Early stage: More critical agents (asynchronous updates) for exploration
+        # Late stage: More regular agents (synchronous updates) for coordination
         train_infos = []
         cost_train_infos = []
-        # progressive async update with synchronous stage for important agents
+        # progressive async update with synchronous stage for regular agents
         action_dim = self.buffer[0].actions.shape[-1]
         factor = np.ones((self.episode_length, self.n_rollout_threads, action_dim), dtype=np.float32)
 
@@ -152,15 +160,24 @@ class Runner(object):
             score = self.trainer[agent_id].estimate_importance(self.buffer[agent_id])
             importance_scores.append((agent_id, score))
 
-        # 2) Select top-k agents for synchronous update (default: top half)
+        # 2) Calculate dynamic critical agent ratio
+        # As training progresses, decrease the proportion of critical agents (reduce async updates)
+        # Critical agents perform asynchronous updates, regular agents perform synchronous updates
+        progress = min(1.0, self.current_episode / self.total_episodes)
+        current_critical_ratio = self.initial_critical_ratio + (self.final_critical_ratio - self.initial_critical_ratio) * progress
+        
+        # 3) Select agents based on dynamic ratio
+        # Critical agents: high importance, updated asynchronously (early stage: more async)
+        # Regular agents: lower importance, updated synchronously (late stage: more sync)
         importance_scores.sort(key=lambda x: x[1], reverse=True)
-        top_k = max(1, self.num_agents // 2)
-        sync_ids = [aid for aid, _ in importance_scores[:top_k]]
-        async_ids = [aid for aid, _ in importance_scores[top_k:]]
+        top_k = max(1, int(self.num_agents * current_critical_ratio))
+        critical_ids = [aid for aid, _ in importance_scores[:top_k]]  # 异步更新的关键智能体
+        regular_ids = [aid for aid, _ in importance_scores[top_k:]]   # 同步更新的普通智能体
 
-        # 3) Synchronous stage: update selected agents without updating factor between them
+        # 4) Synchronous stage: update regular agents without updating factor between them
+        # Regular agents are updated together to maintain coordination
         combined_multiplier = np.ones_like(factor, dtype=np.float32)
-        for agent_id in sync_ids:
+        for agent_id in regular_ids:
             self.trainer[agent_id].prep_training()
             self.buffer[agent_id].update_factor(factor)
 
@@ -200,12 +217,12 @@ class Runner(object):
         # apply combined multiplier once after synchronous stage
         factor = factor * combined_multiplier
 
-        # 4) Asynchronous stage: remaining agents updated sequentially with factor updates
-        # randomize order for async ids to keep stochasticity
-        if len(async_ids) > 0:
-            async_ids = [int(i) for i in torch.tensor(async_ids)[torch.randperm(len(async_ids))].tolist()]
+        # 5) Asynchronous stage: critical agents updated sequentially with factor updates
+        # randomize order for critical ids to keep stochasticity
+        if len(critical_ids) > 0:
+            critical_ids = [int(i) for i in torch.tensor(critical_ids)[torch.randperm(len(critical_ids))].tolist()]
 
-        for agent_id in async_ids:
+        for agent_id in critical_ids:
             self.trainer[agent_id].prep_training()
             self.buffer[agent_id].update_factor(factor)
 
@@ -236,6 +253,9 @@ class Runner(object):
             train_infos.append(train_info)
 
             self.buffer[agent_id].after_update()
+        
+        # Update episode counter for progressive training
+        self.current_episode += 1
 
         return train_infos, cost_train_infos
 
