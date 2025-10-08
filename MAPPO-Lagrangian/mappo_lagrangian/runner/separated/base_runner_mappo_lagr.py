@@ -142,16 +142,33 @@ class Runner(object):
         # have modified for SAD_PPO
         train_infos = []
         cost_train_infos = []
-        # random update order
+        # progressive async update with synchronous stage for important agents
         action_dim = self.buffer[0].actions.shape[-1]
         factor = np.ones((self.episode_length, self.n_rollout_threads, action_dim), dtype=np.float32)
-        for agent_id in torch.randperm(self.num_agents):
+
+        # 1) Estimate importance for each agent
+        importance_scores = []
+        for agent_id in range(self.num_agents):
+            score = self.trainer[agent_id].estimate_importance(self.buffer[agent_id])
+            importance_scores.append((agent_id, score))
+
+        # 2) Select top-k agents for synchronous update (default: top half)
+        importance_scores.sort(key=lambda x: x[1], reverse=True)
+        top_k = max(1, self.num_agents // 2)
+        sync_ids = [aid for aid, _ in importance_scores[:top_k]]
+        async_ids = [aid for aid, _ in importance_scores[top_k:]]
+
+        # 3) Synchronous stage: update selected agents without updating factor between them
+        combined_multiplier = np.ones_like(factor, dtype=np.float32)
+        for agent_id in sync_ids:
             self.trainer[agent_id].prep_training()
             self.buffer[agent_id].update_factor(factor)
+
             available_actions = None if self.buffer[agent_id].available_actions is None \
-                else self.buffer[agent_id].available_actions[:-1].reshape(-1, *self.buffer[
-                                                                                   agent_id].available_actions.shape[
-                                                                               2:])
+                else self.buffer[agent_id].available_actions[:-1].reshape(
+                    -1, *self.buffer[agent_id].available_actions.shape[2:])
+
+            # old log prob with current policy before update
             old_actions_logprob, _ = self.trainer[agent_id].policy.actor.evaluate_actions(
                 self.buffer[agent_id].obs[:-1].reshape(-1, *self.buffer[agent_id].obs.shape[2:]),
                 self.buffer[agent_id].rnn_states[0:1].reshape(-1, *self.buffer[agent_id].rnn_states.shape[2:]),
@@ -160,8 +177,49 @@ class Runner(object):
                 available_actions,
                 self.buffer[agent_id].active_masks[:-1].reshape(-1, *self.buffer[agent_id].active_masks.shape[2:]))
 
-            # safe_buffer, cost_adv = self.buffer_filter(agent_id)
-            # train_info = self.trainer[agent_id].train(safe_buffer, cost_adv)
+            # update parameters
+            train_info = self.trainer[agent_id].train(self.buffer[agent_id])
+
+            # new log prob after update
+            new_actions_logprob, _ = self.trainer[agent_id].policy.actor.evaluate_actions(
+                self.buffer[agent_id].obs[:-1].reshape(-1, *self.buffer[agent_id].obs.shape[2:]),
+                self.buffer[agent_id].rnn_states[0:1].reshape(-1, *self.buffer[agent_id].rnn_states.shape[2:]),
+                self.buffer[agent_id].actions.reshape(-1, *self.buffer[agent_id].actions.shape[2:]),
+                self.buffer[agent_id].masks[:-1].reshape(-1, *self.buffer[agent_id].masks.shape[2:]),
+                available_actions,
+                self.buffer[agent_id].active_masks[:-1].reshape(-1, *self.buffer[agent_id].active_masks.shape[2:]))
+
+            # accumulate multiplier but do not apply to factor yet
+            w = _t2n(torch.exp(new_actions_logprob - old_actions_logprob).reshape(
+                self.episode_length, self.n_rollout_threads, action_dim))
+            combined_multiplier = combined_multiplier * w
+
+            train_infos.append(train_info)
+            self.buffer[agent_id].after_update()
+
+        # apply combined multiplier once after synchronous stage
+        factor = factor * combined_multiplier
+
+        # 4) Asynchronous stage: remaining agents updated sequentially with factor updates
+        # randomize order for async ids to keep stochasticity
+        if len(async_ids) > 0:
+            async_ids = [int(i) for i in torch.tensor(async_ids)[torch.randperm(len(async_ids))].tolist()]
+
+        for agent_id in async_ids:
+            self.trainer[agent_id].prep_training()
+            self.buffer[agent_id].update_factor(factor)
+
+            available_actions = None if self.buffer[agent_id].available_actions is None \
+                else self.buffer[agent_id].available_actions[:-1].reshape(
+                    -1, *self.buffer[agent_id].available_actions.shape[2:])
+
+            old_actions_logprob, _ = self.trainer[agent_id].policy.actor.evaluate_actions(
+                self.buffer[agent_id].obs[:-1].reshape(-1, *self.buffer[agent_id].obs.shape[2:]),
+                self.buffer[agent_id].rnn_states[0:1].reshape(-1, *self.buffer[agent_id].rnn_states.shape[2:]),
+                self.buffer[agent_id].actions.reshape(-1, *self.buffer[agent_id].actions.shape[2:]),
+                self.buffer[agent_id].masks[:-1].reshape(-1, *self.buffer[agent_id].masks.shape[2:]),
+                available_actions,
+                self.buffer[agent_id].active_masks[:-1].reshape(-1, *self.buffer[agent_id].active_masks.shape[2:]))
 
             train_info = self.trainer[agent_id].train(self.buffer[agent_id])
 
@@ -172,9 +230,9 @@ class Runner(object):
                 self.buffer[agent_id].masks[:-1].reshape(-1, *self.buffer[agent_id].masks.shape[2:]),
                 available_actions,
                 self.buffer[agent_id].active_masks[:-1].reshape(-1, *self.buffer[agent_id].active_masks.shape[2:]))
-            factor = factor * _t2n(torch.exp(new_actions_logprob - old_actions_logprob).reshape(self.episode_length,
-                                                                                                self.n_rollout_threads,
-                                                                                                action_dim))
+
+            factor = factor * _t2n(torch.exp(new_actions_logprob - old_actions_logprob).reshape(
+                self.episode_length, self.n_rollout_threads, action_dim))
             train_infos.append(train_info)
 
             self.buffer[agent_id].after_update()

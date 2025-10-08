@@ -258,45 +258,59 @@ class R_MAPPO_Lagr:
 
         policy_loss = policy_action_loss
 
-        self.policy.actor_optimizer.zero_grad()
-
         if update_actor:
+            self.policy.actor_optimizer.zero_grad()
             (policy_loss - dist_entropy * self.entropy_coef).backward()
 
-        if self._use_max_grad_norm:
-            actor_grad_norm = nn.utils.clip_grad_norm_(self.policy.actor.parameters(), self.max_grad_norm)
+            if self._use_max_grad_norm:
+                actor_grad_norm = nn.utils.clip_grad_norm_(self.policy.actor.parameters(), self.max_grad_norm)
+            else:
+                actor_grad_norm = get_gard_norm(self.policy.actor.parameters())
+
+            self.policy.actor_optimizer.step()
+
+            # todo: update lamda_lagr
+            delta_lamda_lagr = -(( aver_episode_costs.mean() - self.safety_bound) * (1 - self.gamma) + (imp_weights * cost_adv_targ)).mean().detach()
+
+            R_Relu = torch.nn.ReLU()
+            new_lamda_lagr = R_Relu(self.lamda_lagr - (delta_lamda_lagr * self.lagrangian_coef))
+
+            self.lamda_lagr = new_lamda_lagr
+
+            # todo: reward critic update
+            value_loss = self.cal_value_loss(values, value_preds_batch, return_batch, active_masks_batch)
+            self.policy.critic_optimizer.zero_grad()
+            (value_loss * self.value_loss_coef).backward()
+            if self._use_max_grad_norm:
+                critic_grad_norm = nn.utils.clip_grad_norm_(self.policy.critic.parameters(), self.max_grad_norm)
+            else:
+                critic_grad_norm = get_gard_norm(self.policy.critic.parameters())
+            self.policy.critic_optimizer.step()
+
+            # todo: cost critic update
+            cost_loss = self.cal_value_loss(cost_values, cost_preds_batch, cost_returns_barch, active_masks_batch)
+            self.policy.cost_optimizer.zero_grad()
+            (cost_loss * self.value_loss_coef).backward()
+            if self._use_max_grad_norm:
+                cost_grad_norm = nn.utils.clip_grad_norm_(self.policy.cost_critic.parameters(), self.max_grad_norm)
+            else:
+                cost_grad_norm = get_gard_norm(self.policy.cost_critic.parameters())
+            self.policy.cost_optimizer.step()
         else:
-            actor_grad_norm = get_gard_norm(self.policy.actor.parameters())
+            # When not updating, still compute losses and gradient norms for importance estimation
+            with torch.no_grad():
+                if self._use_max_grad_norm:
+                    actor_grad_norm = get_gard_norm(self.policy.actor.parameters())
+                else:
+                    actor_grad_norm = get_gard_norm(self.policy.actor.parameters())
 
-        self.policy.actor_optimizer.step()
-
-        # todo: update lamda_lagr
-        delta_lamda_lagr = -(( aver_episode_costs.mean() - self.safety_bound) * (1 - self.gamma) + (imp_weights * cost_adv_targ)).mean().detach()
-
-        R_Relu = torch.nn.ReLU()
-        new_lamda_lagr = R_Relu(self.lamda_lagr - (delta_lamda_lagr * self.lagrangian_coef))
-
-        self.lamda_lagr = new_lamda_lagr
-
-        # todo: reward critic update
-        value_loss = self.cal_value_loss(values, value_preds_batch, return_batch, active_masks_batch)
-        self.policy.critic_optimizer.zero_grad()
-        (value_loss * self.value_loss_coef).backward()
-        if self._use_max_grad_norm:
-            critic_grad_norm = nn.utils.clip_grad_norm_(self.policy.critic.parameters(), self.max_grad_norm)
-        else:
-            critic_grad_norm = get_gard_norm(self.policy.critic.parameters())
-        self.policy.critic_optimizer.step()
-
-        # todo: cost critic update
-        cost_loss = self.cal_value_loss(cost_values, cost_preds_batch, cost_returns_barch, active_masks_batch)
-        self.policy.cost_optimizer.zero_grad()
-        (cost_loss * self.value_loss_coef).backward()
-        if self._use_max_grad_norm:
-            cost_grad_norm = nn.utils.clip_grad_norm_(self.policy.cost_critic.parameters(), self.max_grad_norm)
-        else:
-            cost_grad_norm = get_gard_norm(self.policy.cost_critic.parameters())
-        self.policy.cost_optimizer.step()
+            # Compute losses without backpropagation
+            value_loss = self.cal_value_loss(values, value_preds_batch, return_batch, active_masks_batch)
+            cost_loss = self.cal_value_loss(cost_values, cost_preds_batch, cost_returns_barch, active_masks_batch)
+            
+            # Set gradient norms to 0 when not updating
+            critic_grad_norm = 0.0
+            cost_grad_norm = 0.0
 
         return value_loss, critic_grad_norm, policy_loss, dist_entropy, actor_grad_norm, imp_weights, cost_loss, cost_grad_norm
 
@@ -376,3 +390,79 @@ class R_MAPPO_Lagr:
         self.policy.actor.eval()
         self.policy.critic.eval()
         self.policy.cost_critic.eval()
+
+    def estimate_importance(self, buffer):
+        """
+        Estimate an importance score for this agent's update by actually calling
+        ppo_update (without parameter updates) and using the returned loss values.
+        Higher score indicates larger expected impact on the policy update.
+
+        The score combines value_loss, policy_loss, cost_loss, and gradient norms
+        from ppo_update to reflect the true training importance.
+        """
+        # Compute normalized advantages and cost advantages (same as train)
+        if self._use_popart:
+            advantages = buffer.returns[:-1] - self.value_normalizer.denormalize(buffer.value_preds[:-1])
+            cost_adv = buffer.cost_returns[:-1] - self.value_normalizer.denormalize(buffer.cost_preds[:-1])
+        else:
+            advantages = buffer.returns[:-1] - buffer.value_preds[:-1]
+            cost_adv = buffer.cost_returns[:-1] - buffer.cost_preds[:-1]
+
+        advantages_copy = advantages.copy()
+        advantages_copy[buffer.active_masks[:-1] == 0.0] = np.nan
+        mean_advantages = np.nanmean(advantages_copy)
+        std_advantages = np.nanstd(advantages_copy)
+        advantages = (advantages - mean_advantages) / (std_advantages + 1e-5)
+
+        cost_adv_copy = cost_adv.copy()
+        cost_adv_copy[buffer.active_masks[:-1] == 0.0] = np.nan
+        mean_cost_adv = np.nanmean(cost_adv_copy)
+        std_cost_adv = np.nanstd(cost_adv_copy)
+        cost_adv = (cost_adv - mean_cost_adv) / (std_cost_adv + 1e-5)
+
+        # Build data generator like in train()
+        if self._use_naive_recurrent:
+            data_generator = buffer.naive_recurrent_generator(advantages, self.num_mini_batch, cost_adv)
+        else:
+            data_generator = buffer.feed_forward_generator(advantages, self.num_mini_batch, cost_adv=cost_adv)
+
+        # Store original parameters to restore later
+        original_actor_params = [p.clone() for p in self.policy.actor.parameters()]
+        original_critic_params = [p.clone() for p in self.policy.critic.parameters()]
+        original_cost_critic_params = [p.clone() for p in self.policy.cost_critic.parameters()]
+        original_lamda_lagr = self.lamda_lagr
+
+        importance_scores = []
+        
+        # Run ppo_update without actually updating parameters
+        for sample in data_generator:
+            # Call ppo_update with update_actor=False to get loss values without parameter updates
+            value_loss, critic_grad_norm, policy_loss, dist_entropy, actor_grad_norm, imp_weights, cost_loss, cost_grad_norm = \
+                self.ppo_update(sample, update_actor=False)
+            
+            # Restore parameters after ppo_update (in case any were modified)
+            for orig_p, p in zip(original_actor_params, self.policy.actor.parameters()):
+                p.data.copy_(orig_p.data)
+            for orig_p, p in zip(original_critic_params, self.policy.critic.parameters()):
+                p.data.copy_(orig_p.data)
+            for orig_p, p in zip(original_cost_critic_params, self.policy.cost_critic.parameters()):
+                p.data.copy_(orig_p.data)
+            self.lamda_lagr = original_lamda_lagr
+
+            # Compute importance score from ppo_update return values
+            # Combine different loss components with weights
+            # Higher losses indicate more important updates
+            score = (
+                0.4 * value_loss.item() +           # Value function loss
+                0.3 * policy_loss.item() +          # Policy loss  
+                0.2 * cost_loss.item() +            # Cost critic loss
+                0.05 * actor_grad_norm +            # Actor gradient norm
+                0.05 * critic_grad_norm             # Critic gradient norm
+            )
+            
+            importance_scores.append(score)
+
+        # Final importance score across minibatches
+        if len(importance_scores) == 0:
+            return 0.0
+        return float(np.mean(importance_scores))
