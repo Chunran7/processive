@@ -420,6 +420,11 @@ class R_MAPPO_Lagr:
         std_cost_adv = np.nanstd(cost_adv_copy)
         cost_adv = (cost_adv - mean_cost_adv) / (std_cost_adv + 1e-5)
 
+        # Set factor to ensure correct parameter count (18 instead of 12)
+        # Use factor of ones for neutral evaluation without inter-agent influence
+        factor = np.ones_like(buffer.rewards[:-1])
+        buffer.update_factor(factor)
+
         # Build data generator like in train()
         if self._use_naive_recurrent:
             data_generator = buffer.naive_recurrent_generator(advantages, self.num_mini_batch, cost_adv)
