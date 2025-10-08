@@ -422,7 +422,8 @@ class R_MAPPO_Lagr:
 
         # Set factor to ensure correct parameter count (18 instead of 12)
         # Use factor of ones for neutral evaluation without inter-agent influence
-        factor = np.ones_like(buffer.rewards[:-1])
+        action_dim = buffer.actions.shape[-1]
+        factor = np.ones((buffer.episode_length, buffer.n_rollout_threads, action_dim), dtype=np.float32)
         buffer.update_factor(factor)
 
         # Build data generator like in train()
