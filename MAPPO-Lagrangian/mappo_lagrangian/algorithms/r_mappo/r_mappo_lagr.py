@@ -393,12 +393,12 @@ class R_MAPPO_Lagr:
 
     def estimate_importance(self, buffer):
         """
-        Estimate an importance score for this agent's update by actually calling
-        ppo_update (without parameter updates) and using the returned loss values.
+        Estimate an importance score for this agent's update by computing
+        the key loss values directly without parameter updates.
         Higher score indicates larger expected impact on the policy update.
 
-        The score combines value_loss, policy_loss, cost_loss, and gradient norms
-        from ppo_update to reflect the true training importance.
+        The score combines value_loss, policy_loss, and cost_loss to reflect
+        the true training importance.
         """
         # Compute normalized advantages and cost advantages (same as train)
         if self._use_popart:
@@ -432,38 +432,57 @@ class R_MAPPO_Lagr:
         else:
             data_generator = buffer.feed_forward_generator(advantages, self.num_mini_batch, cost_adv=cost_adv)
 
-        # Store original parameters to restore later
-        original_actor_params = [p.clone() for p in self.policy.actor.parameters()]
-        original_critic_params = [p.clone() for p in self.policy.critic.parameters()]
-        original_cost_critic_params = [p.clone() for p in self.policy.cost_critic.parameters()]
-        original_lamda_lagr = self.lamda_lagr
-
         importance_scores = []
         
-        # Run ppo_update without actually updating parameters
+        # Compute importance scores directly without calling ppo_update
         for sample in data_generator:
-            # Call ppo_update with update_actor=False to get loss values without parameter updates
-            value_loss, critic_grad_norm, policy_loss, dist_entropy, actor_grad_norm, imp_weights, cost_loss, cost_grad_norm = \
-                self.ppo_update(sample, update_actor=False)
-            
-            # Restore parameters after ppo_update (in case any were modified)
-            for orig_p, p in zip(original_actor_params, self.policy.actor.parameters()):
-                p.data.copy_(orig_p.data)
-            for orig_p, p in zip(original_critic_params, self.policy.critic.parameters()):
-                p.data.copy_(orig_p.data)
-            for orig_p, p in zip(original_cost_critic_params, self.policy.cost_critic.parameters()):
-                p.data.copy_(orig_p.data)
-            self.lamda_lagr = original_lamda_lagr
+            share_obs_batch, obs_batch, rnn_states_batch, rnn_states_critic_batch, actions_batch, \
+            value_preds_batch, return_batch, masks_batch, active_masks_batch, old_action_log_probs_batch, \
+            adv_targ, available_actions_batch, factor_batch, cost_preds_batch, cost_returns_barch, rnn_states_cost_batch, \
+            cost_adv_targ, aver_episode_costs = sample
 
-            # Compute importance score from ppo_update return values
-            # Combine different loss components with weights
+            # Convert to tensors
+            adv_targ = check(adv_targ).to(**self.tpdv)
+            cost_adv_targ = check(cost_adv_targ).to(**self.tpdv)
+            value_preds_batch = check(value_preds_batch).to(**self.tpdv)
+            return_batch = check(return_batch).to(**self.tpdv)
+            active_masks_batch = check(active_masks_batch).to(**self.tpdv)
+            cost_preds_batch = check(cost_preds_batch).to(**self.tpdv)
+            cost_returns_barch = check(cost_returns_barch).to(**self.tpdv)
+
+            # Forward pass to get current values
+            with torch.no_grad():
+                values, action_log_probs, dist_entropy, cost_values = self.policy.evaluate_actions(
+                    share_obs_batch, obs_batch, rnn_states_batch, rnn_states_critic_batch,
+                    actions_batch, masks_batch, available_actions_batch, active_masks_batch,
+                    rnn_states_cost_batch)
+
+                # Compute losses directly
+                value_loss = self.cal_value_loss(values, value_preds_batch, return_batch, active_masks_batch)
+                cost_loss = self.cal_value_loss(cost_values, cost_preds_batch, cost_returns_barch, active_masks_batch)
+                
+                # Compute policy loss (simplified version from ppo_update)
+                old_action_log_probs_batch = check(old_action_log_probs_batch).to(**self.tpdv)
+                factor_batch = check(factor_batch).to(**self.tpdv)
+                
+                adv_targ_hybrid = adv_targ - self.lamda_lagr * cost_adv_targ
+                imp_weights = torch.exp(action_log_probs - old_action_log_probs_batch)
+                
+                surr1 = imp_weights * adv_targ_hybrid
+                surr2 = torch.clamp(imp_weights, 1.0 - self.clip_param, 1.0 + self.clip_param) * adv_targ_hybrid
+
+                if self._use_policy_active_masks:
+                    policy_loss = (-torch.sum(factor_batch * torch.min(surr1, surr2),
+                                             dim=-1, keepdim=True) * active_masks_batch).sum() / active_masks_batch.sum()
+                else:
+                    policy_loss = -torch.sum(factor_batch * torch.min(surr1, surr2), dim=-1, keepdim=True).mean()
+
+            # Compute importance score from loss values
             # Higher losses indicate more important updates
             score = (
                 0.4 * value_loss.item() +           # Value function loss
-                0.3 * policy_loss.item() +          # Policy loss  
-                0.2 * cost_loss.item() +            # Cost critic loss
-                0.05 * actor_grad_norm +            # Actor gradient norm
-                0.05 * critic_grad_norm             # Critic gradient norm
+                0.4 * policy_loss.item() +          # Policy loss  
+                0.2 * cost_loss.item()              # Cost critic loss
             )
             
             importance_scores.append(score)
